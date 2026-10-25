@@ -40,6 +40,12 @@
   const mix = (a, b, t) => a + (b - a) * t;
   const sstep = (a, b, x) => { const t = clamp((x - a) / (b - a)); return t * t * (3 - 2 * t); };
   function hash(x, y) { const s = Math.sin(x * 127.1 + y * 311.7) * 43758.5453; return s - Math.floor(s); }
+  function vnoise(x, y) {
+    const ix = Math.floor(x), iy = Math.floor(y), fx = x - ix, fy = y - iy;
+    const a = hash(ix, iy), b = hash(ix + 1, iy), c = hash(ix, iy + 1), d = hash(ix + 1, iy + 1);
+    const ux = fx * fx * (3 - 2 * fx), uy = fy * fy * (3 - 2 * fy);
+    return a + (b - a) * ux + (c - a) * uy + (a - b - c + d) * ux * uy;
+  }
 
   const RAMP = " .'`^\",:;Il!i><~+_-?][}{1)(|\\/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$";
   const NR = RAMP.length - 1;
@@ -63,7 +69,7 @@
 
   /* ---------- rejilla ---------- */
   let W = 0, H = 0, dpr = 1, cw = 6, chh = 9, cols = 0, rows = 0, fs = 9;
-  let sc, sctx, lumBuf;
+  let sc, sctx, lumBuf, vBuf, sc2, sc2ctx;
   function resize() {
     dpr = Math.min(window.devicePixelRatio || 1, 2);
     W = Math.max(1, window.innerWidth); H = Math.max(1, window.innerHeight);
@@ -77,16 +83,18 @@
     sc = document.createElement("canvas"); sc.width = cols; sc.height = rows;
     sctx = sc.getContext("2d", { willReadFrequently: true });
     sctx.imageSmoothingEnabled = true; sctx.imageSmoothingQuality = "high";
-    lumBuf = new Float32Array(cols * rows);
+    lumBuf = new Float32Array(cols * rows); vBuf = new Float32Array(cols * rows);
+    sc2 = document.createElement("canvas"); sc2.width = cols; sc2.height = rows; sc2ctx = sc2.getContext("2d");
   }
 
-  const LOOP = 25, T_ZOOM = 17, T_FADE = 22.2;
+  const LOOP = 28, T_BUILD = 3.5, T_ZOOM = 17, T_FADE = 25.4;
+  const REV_SPEED = .035;   // qué tan rápido se va 'pintando' el cuadro (desde el centro hacia afuera)
 
   function render(t) {
     ctx.fillStyle = "#030308"; ctx.fillRect(0, 0, W, H);
     if (!ready) return;
 
-    const s = clamp(t / T_ZOOM), e = 1 - Math.pow(1 - s, 2.4);
+    const s = clamp((t - T_BUILD) / T_ZOOM), e = 1 - Math.pow(1 - s, 2.4);
     const Z = mix(4.2, 1, e);
     const cxp = mix(.50, .5, e), cyp = mix(.33 * HP / .79, HP / 2, e);
     const F = Math.min(W / 1, H / HP) * .96;
@@ -108,11 +116,26 @@
       const dx = (ix0 - x0) / vw * cols, dy = (iy0 - y0) / vh * rows, dW = (ix1 - ix0) / vw * cols, dH = (iy1 - iy0) / vh * rows;
       sctx.drawImage(L, sx, sy, sW, sH, dx, dy, dW, dH);
     }
-    const d = sctx.getImageData(0, 0, cols, rows).data;
+    const id = sctx.getImageData(0, 0, cols, rows), d = id.data;
+
+    // construcción: el cuadro se va "pintando" desde el centro hacia afuera
+    const rev = Math.max(0, t - .3) * REV_SPEED;
+    for (let j = 0; j < rows; j++) {
+      const py = y0 + (j + .5) / rows * vh;
+      for (let i = 0; i < cols; i++) {
+        const k = j * cols + i, px = x0 + (i + .5) / cols * vw;
+        const dist = Math.hypot(px - .5, (py - HP / 2) * 1.1);
+        const off = .09 * (vnoise(px * 15, py * 15) - .5) + .03 * (hash(i, j) - .5);
+        const v = clamp((rev - dist - off) / .05);
+        vBuf[k] = v;
+        d[k * 4 + 3] = v * 255;
+      }
+    }
+    sc2ctx.putImageData(id, 0, 0);
 
     // fondo suave con los colores del cuadro (para que se reconozca la imagen)
     ctx.save(); ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = "high";
-    ctx.globalAlpha = .42 * fade; ctx.drawImage(sc, 0, 0, cols * cw, rows * chh); ctx.restore();
+    ctx.globalAlpha = .42 * fade; ctx.drawImage(sc2, 0, 0, cols * cw, rows * chh); ctx.restore();
 
     // luminancia para detectar la dirección de la pincelada
     for (let k = 0, n = cols * rows; k < n; k++) lumBuf[k] = (.299 * d[k * 4] + .587 * d[k * 4 + 1] + .114 * d[k * 4 + 2]) / 255;
@@ -122,7 +145,8 @@
       for (let i = 0; i < cols; i++) {
         const k = j * cols + i, p = k * 4;
         const lum = lumBuf[k];
-        if (lum < .045) continue;
+        const vv = vBuf[k];
+        if (lum < .045 || vv <= 0) continue;
         const r = d[p] / 255, g = d[p + 1] / 255, b = d[p + 2] / 255;
         // gradiente -> dirección de la pincelada
         const gx = (i < cols - 1 ? lumBuf[k + 1] : lum) - (i > 0 ? lumBuf[k - 1] : lum);
@@ -130,7 +154,10 @@
         const mag = Math.hypot(gx, gy);
         const hh = hash(i * 1.9 + tq * .13, j * 2.7 + tq * .5);
         let ch;
-        if (mag > .04 && hh < .34) {
+        if (vv < 1) {
+          // en el frente de pintura las letras “se arman”: caracteres al azar que se asientan
+          ch = RAMP[(hash(i * 3.1, j * 1.7 + Math.floor(t * 16)) * NR) | 0];
+        } else if (mag > .04 && hh < .34) {
           const a2 = ((Math.atan2(gy, gx) + Math.PI / 2) % Math.PI + Math.PI) % Math.PI;
           ch = DIR[Math.round(a2 / (Math.PI / 4)) % 4];
         } else {
@@ -145,14 +172,16 @@
         const mx = Math.max(r, g, b, .05), lm = (r + g + b) / 3;
         const sat = 1.25;                       // color más vivo
         const rr = clamp(lm + (r - lm) * sat) / mx, gg = clamp(lm + (g - lm) * sat) / mx, bb = clamp(lm + (b - lm) * sat) / mx;
-        const f = (.62 + .55 * Math.min(1, lum * 1.6)) * fade * tw;
-        ctx.fillStyle = `rgb(${clamp(rr * f) * 255 | 0},${clamp(gg * f) * 255 | 0},${clamp(bb * f) * 255 | 0})`;
+        const glow = 1 - vv;                    // 0 = ya pintado, 1 = recién tocado por el pincel
+        const f = (.62 + .55 * Math.min(1, lum * 1.6)) * fade * tw * (1 + .6 * glow);
+        const R2 = mix(rr, 1.0, glow * .75), G2 = mix(gg, .93, glow * .75), B2 = mix(bb, .72, glow * .75);
+        ctx.fillStyle = `rgb(${clamp(R2 * f) * 255 | 0},${clamp(G2 * f) * 255 | 0},${clamp(B2 * f) * 255 | 0})`;
         ctx.fillText(ch, (i + .5) * cw, (j + .5) * chh);
       }
     }
   }
 
-  let t0 = performance.now(), paused = true, tPaused = 17.5;   // antes de iniciar: se ve el cuadro completo, quieto
+  let t0 = performance.now(), paused = true, tPaused = 26;   // antes de iniciar: se ve el cuadro completo, quieto
 
   /* ---------- música + inicio ---------- */
   const bgm = document.getElementById("bgm"), startEl = document.getElementById("start"),
